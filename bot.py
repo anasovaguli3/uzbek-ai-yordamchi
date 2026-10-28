@@ -4,15 +4,20 @@ import logging
 import os
 
 import anthropic
+import ollama
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# .env faylidan ANTHROPIC_API_KEY va TELEGRAM_BOT_TOKEN ni o'qiydi
+# .env faylidan TELEGRAM_BOT_TOKEN, PROVIDER va (kerak bo'lsa) ANTHROPIC_API_KEY ni o'qiydi
 load_dotenv()
 
-MODEL = "claude-opus-5-5"
+# PROVIDER=ollama — bepul, kompyuteringizdagi lokal model
+# PROVIDER=claude — Claude API (pullik, sifatliroq)
+PROVIDER = os.getenv("PROVIDER", "ollama").lower()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+CLAUDE_MODEL = "claude-opus-5-5"
 SYSTEM = (
     "Sen o'zbek tilida gaplashadigan foydali yordamchisan. "
     "Har doim o'zbek tilida (lotin yozuvida), aniq va qisqa javob ber. "
@@ -24,8 +29,36 @@ TELEGRAM_LIMIT = 4096  # Telegram bitta xabarga ruxsat beradigan belgilar soni
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-client = anthropic.AsyncAnthropic()
 tarixlar: dict[int, list[dict]] = {}  # chat_id -> suhbat tarixi
+
+if PROVIDER == "claude":
+    claude_client = anthropic.AsyncAnthropic()
+else:
+    ollama_client = ollama.AsyncClient()
+
+
+async def claude_javob(tarix: list[dict]) -> str | None:
+    response = await claude_client.beta.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=16000,
+        system=SYSTEM,
+        messages=tarix,
+        # Model rad etsa, server avtomatik boshqa modelga o'tkazadi
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    )
+    if response.stop_reason == "refusal":
+        return None
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+async def ollama_javob(tarix: list[dict]) -> str:
+    response = await ollama_client.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "system", "content": SYSTEM}, *tarix],
+        think=False,  # qwen3 "o'ylash" rejimini o'chiramiz: tezroq javob beradi
+    )
+    return response.message.content.strip()
 
 
 async def javob_ol(chat_id: int, savol: str) -> str:
@@ -33,24 +66,18 @@ async def javob_ol(chat_id: int, savol: str) -> str:
     tarix.append({"role": "user", "content": savol})
 
     try:
-        response = await client.beta.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            system=SYSTEM,
-            messages=tarix,
-            # Model rad etsa, server avtomatik boshqa modelga o'tkazadi
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
+        if PROVIDER == "claude":
+            javob = await claude_javob(tarix)
+        else:
+            javob = await ollama_javob(tarix)
     except Exception:
         tarix.pop()  # muvaffaqiyatsiz savolni tarixda qoldirmaymiz
         raise
 
-    if response.stop_reason == "refusal":
+    if javob is None:
         tarix.pop()
         return "Kechirasiz, bu savolga javob bera olmayman."
 
-    javob = "".join(b.text for b in response.content if b.type == "text")
     tarix.append({"role": "assistant", "content": javob})
 
     # Tarix juda uzayib ketmasin: eng eski savol-javob juftlarini o'chiramiz
@@ -88,6 +115,12 @@ async def xabar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except anthropic.APIStatusError as e:
         logging.error("API xatosi %s: %s", e.status_code, e.message)
         javob = "Xatolik yuz berdi. Qayta urinib ko'ring."
+    except ollama.ResponseError as e:
+        logging.error("Ollama xatosi: %s", e.error)
+        javob = "Lokal modelda xatolik. Model yuklanganini tekshiring (ollama list)."
+    except ConnectionError:
+        logging.error("Ollama ishlamayapti")
+        javob = "Lokal AI ishlamayapti. Ollama dasturini ishga tushiring."
 
     # Uzun javoblarni bir nechta xabarga bo'lib yuboramiz
     for i in range(0, len(javob), TELEGRAM_LIMIT):
@@ -104,7 +137,8 @@ def main() -> None:
     app.add_handler(CommandHandler("yangi", yangi))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, xabar))
 
-    logging.info("Bot ishga tushdi")
+    model = CLAUDE_MODEL if PROVIDER == "claude" else OLLAMA_MODEL
+    logging.info("Bot ishga tushdi (provayder: %s, model: %s)", PROVIDER, model)
     app.run_polling()
 
 
